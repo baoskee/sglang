@@ -134,6 +134,7 @@ class UnifiedLRUList:
         use_host_ptr: bool = False,
     ):
         self.component_type = component_type
+        self.use_host_ptr = use_host_ptr
         # Pointer slot: host LRU uses offset slots so device/host pointers
         # never collide on the same node.
         self._pt: int = component_type + (_NUM_COMPONENT_TYPES if use_host_ptr else 0)
@@ -191,13 +192,16 @@ class UnifiedLRUList:
     def in_list(self, node: Optional[UnifiedTreeNode]):
         return node is not None and node.id in self.cache
 
+    def _locked(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.component_type]
+        return cd.host_lock_ref > 0 if self.use_host_ptr else cd.lock_ref > 0
+
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
         pt = self._pt
-        ct = self.component_type
         x = node.lru_prev[pt]
-        while x.component_data[ct].lock_ref > 0:
+        while self._locked(x):
             x = x.lru_prev[pt]
         if x == self.head:
             return None
@@ -207,9 +211,8 @@ class UnifiedLRUList:
         if check_id:
             assert node.id in self.cache
         pt = self._pt
-        ct = self.component_type
         x = node.lru_prev[pt]
-        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
+        while self._locked(x) or len(x.children) > 0:
             x = x.lru_prev[pt]
         if x == self.head:
             return None
@@ -1274,7 +1277,7 @@ class UnifiedRadixCache(BasePrefixCache):
             cd = node.component_data[ct]
             if cd.host_value is None:
                 continue
-            if cd.host_lock_ref == 0 and self.host_lru_lists[ct].in_list(node):
+            if self.host_lru_lists[ct].in_list(node):
                 self.host_lru_lists[ct].remove_node(node)
             cd.host_lock_ref += 1
 
@@ -1294,6 +1297,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     cd.host_lock_ref == 0
                     and cd.value is None
                     and cd.host_value is not None
+                    and not self.host_lru_lists[ct].in_list(node)
                 ):
                     self.host_lru_lists[ct].insert_mru(node)
         self._update_evictable_leaf_sets(node)

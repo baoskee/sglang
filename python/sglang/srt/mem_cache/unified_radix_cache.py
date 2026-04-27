@@ -1037,10 +1037,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # have been freed, we can safely tombstone Full.value.
         # This is deferred from evict_component because free_swa needs it.
         if (
-            target is EvictLayer.DEVICE
+            EvictLayer.DEVICE in target
             and trigger.component_type == BASE_COMPONENT_TYPE
         ):
-            node.component_data[trigger.component_type].value = None
+            cd = node.component_data[trigger.component_type]
+            assert cd.value is not None, (
+                "Full.value must stay present until _cascade_evict completes "
+                "because auxiliary components may need it during eviction."
+            )
+            cd.value = None
+            assert cd.value is None
 
         self._update_evictable_leaf_sets(node)
 
@@ -1242,6 +1248,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._evict_component_and_detach_lru(
                         node, comp, target=EvictLayer.ALL, tracker=tracker
                     )
+                node.component_data[BASE_COMPONENT_TYPE].value = None
                 self.evictable_device_leaves.discard(node)
                 parent = node.parent
                 self._remove_leaf_from_parent(node)

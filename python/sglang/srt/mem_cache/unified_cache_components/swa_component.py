@@ -397,18 +397,28 @@ class SWAComponent(TreeComponent):
             # Walk the evicted chain leaf to root, collecting SWA host_values
             # until they cover sliding_window_size. SWA host data is always a
             # contiguous suffix, so the first None ends the walk.
+            max_suffix_tokens = kw.get("max_suffix_tokens", self.sliding_window_size)
+            target_swa_tokens = min(self.sliding_window_size, max_suffix_tokens)
+            if target_swa_tokens <= 0:
+                return None
             collected_leaf_first: list[torch.Tensor] = []
             nodes_leaf_first: list = []
             n_swa = 0
             cur = node
-            while cur.evicted:
+            while cur.evicted and n_swa < target_swa_tokens:
                 cd = cur.component_data[ct]
                 if cd.host_value is None:
                     break
+                remaining = target_swa_tokens - n_swa
+                if len(cd.host_value) > remaining:
+                    split_len = len(cur.key) - remaining
+                    if split_len > 0:
+                        self.cache._split_node(cur.key, cur, split_len)
+                        cd = cur.component_data[ct]
                 collected_leaf_first.append(cd.host_value)
                 nodes_leaf_first.append(cur)
                 n_swa += len(cd.host_value)
-                if n_swa >= self.sliding_window_size:
+                if n_swa >= target_swa_tokens:
                     break
                 cur = cur.parent
             if not collected_leaf_first:

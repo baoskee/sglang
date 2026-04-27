@@ -310,8 +310,12 @@ class HybridCacheController(BaseHiCacheController):
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         elif swa_xfer is not None:
+            swa_suffix_tokens = min(swa_xfer.swa_suffix_tokens, len(host_indices))
+            if swa_suffix_tokens != swa_xfer.swa_suffix_tokens:
+                swa_xfer.swa_suffix_tokens = swa_suffix_tokens
+                swa_xfer.host_indices = swa_xfer.host_indices[-swa_suffix_tokens:]
             result = self.mem_pool_device_allocator.alloc_full_with_suffix_swa(
-                len(host_indices), swa_xfer.swa_suffix_tokens
+                len(host_indices), swa_suffix_tokens
             )
             if result is None:
                 return None

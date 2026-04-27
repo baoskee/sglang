@@ -1474,7 +1474,10 @@ class UnifiedRadixCache(BasePrefixCache):
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
             t = comp.build_hicache_transfers(
-                last_hit_node, CacheTransferPhase.LOAD_BACK, req=req
+                last_hit_node,
+                CacheTransferPhase.LOAD_BACK,
+                req=req,
+                max_suffix_tokens=kv_tokens,
             )
             if t:
                 comp_xfers[comp.component_type] = t
@@ -1523,6 +1526,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        for xfer in aux_xfers:
+            if xfer.name == PoolName.SWA and xfer.swa_suffix_tokens > kv_tokens:
+                xfer.swa_suffix_tokens = kv_tokens
+                xfer.host_indices = xfer.host_indices[-kv_tokens:]
         device_indices = self.cache_controller.load(
             host_indices=kv_xfer.host_indices,
             node_id=last_hit_node.id,
@@ -1982,6 +1989,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 and swa_loaded_tokens > 0
             ):
                 target = new_node
+                swa_loaded_tokens = min(swa_loaded_tokens, len(new_node.key))
+                swa_host_indices = swa_host_indices[-swa_loaded_tokens:]
                 if swa_loaded_tokens < len(new_node.key):
                     split_len = len(new_node.key) - swa_loaded_tokens
                     parent = self._split_node(new_node.key, new_node, split_len)

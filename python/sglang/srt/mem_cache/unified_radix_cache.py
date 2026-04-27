@@ -648,16 +648,17 @@ class UnifiedRadixCache(BasePrefixCache):
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
-        if ComponentType.SWA in self.components and req.swa_evicted_seqlen > 0:
-            valid_swa_suffix_len = page_aligned_len - req.swa_evicted_seqlen
-            sliding_window_size = self.components[ComponentType.SWA].sliding_window_size
-            if 0 < valid_swa_suffix_len < sliding_window_size:
-                req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
-                for comp in self._components_tuple:
-                    comp.cleanup_after_caching_req(
-                        req, is_finished=False, insert_params=insert_params
-                    )
-                return
+        pre_match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        if (
+            req.cache_protected_len
+            > len(pre_match_result.device_indices) + self.page_size - 1
+        ):
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=False, insert_params=insert_params
+                )
+            return
 
         insert_params.key = radix_key
         insert_params.value = values

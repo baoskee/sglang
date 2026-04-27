@@ -654,6 +654,19 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
+        if req.cache_protected_len > len(new_indices) + self.page_size - 1:
+            # SWA may reject the just-inserted unfinished chunk until the tree
+            # contains a full sliding-window suffix. Keep the existing protected
+            # prefix lock and continue with request-local KV for the new tokens.
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req,
+                    is_finished=False,
+                    insert_result=result,
+                    insert_params=insert_params,
+                )
+            return
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"

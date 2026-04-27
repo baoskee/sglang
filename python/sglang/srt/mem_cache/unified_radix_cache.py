@@ -90,6 +90,18 @@ class UnifiedTreeNode:
     def __lt__(self, other: UnifiedTreeNode):
         return self.last_access_time < other.last_access_time
 
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+    def get_prefix_hash_values(self, node: "UnifiedTreeNode") -> list[str]:
+        """Returns all hash values from root to node (inclusive)."""
+        if node is None or node.hash_value is None:
+            return []
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
+
 
 class UnifiedLRUList:
     def __init__(

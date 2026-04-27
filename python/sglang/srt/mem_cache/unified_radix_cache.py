@@ -426,7 +426,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_timeout_per_page = prefetch_timeout_per_page
             self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
             self.hicache_storage_pass_prefix_keys = (
-                server_args.hicache_storage_pass_prefix_keys or extra_pass_prefix_keys
+                getattr(server_args, "hicache_storage_pass_prefix_keys", False)
+                or extra_pass_prefix_keys
             )
 
         logger.info(

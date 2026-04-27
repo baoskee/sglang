@@ -1086,7 +1086,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if tracker is not None:
             if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed
-            elif EvictLayer.HOST in target:
+            if EvictLayer.HOST in target:
                 tracker[comp.component_type] += host_freed
 
         # Detach from the appropriate LRU list(s)

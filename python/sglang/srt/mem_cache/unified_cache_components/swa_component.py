@@ -100,10 +100,11 @@ class SWAComponent(TreeComponent):
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice.clone()
+            old_full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            new_full_value = value_slice
+            if not torch.equal(old_full_value, new_full_value):
+                self.cache.token_to_kv_pool_allocator.free(old_full_value)
+            node.component_data[BASE_COMPONENT_TYPE].value = new_full_value.clone()
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -114,13 +115,14 @@ class SWAComponent(TreeComponent):
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
-            )
-            self.cache._split_node(node.key, node, start_idx)
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
+            old_full_suffix = node.component_data[BASE_COMPONENT_TYPE].value[
                 start_idx:
-            ].clone()
+            ]
+            new_full_suffix = value_slice[start_idx:]
+            if not torch.equal(old_full_suffix, new_full_suffix):
+                self.cache.token_to_kv_pool_allocator.free(old_full_suffix)
+            self.cache._split_node(node.key, node, start_idx)
+            node.component_data[BASE_COMPONENT_TYPE].value = new_full_suffix.clone()
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )

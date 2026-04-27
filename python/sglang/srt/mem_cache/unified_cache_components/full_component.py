@@ -221,7 +221,7 @@ class FullComponent(TreeComponent):
                 PoolTransfer(
                     name=PoolName.KV,
                     host_indices=(
-                        torch.cat(backed_up)
+                        torch.cat([x.cpu() for x in backed_up])
                         if backed_up
                         else torch.empty((0,), dtype=torch.int64, device="cpu")
                     ),

@@ -418,7 +418,7 @@ class SWAComponent(TreeComponent):
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=torch.cat(collected_leaf_first),
+                    host_indices=torch.cat([x.cpu() for x in collected_leaf_first]),
                     device_indices=None,
                     swa_suffix_tokens=n_swa,
                     nodes_to_load=nodes_leaf_first,

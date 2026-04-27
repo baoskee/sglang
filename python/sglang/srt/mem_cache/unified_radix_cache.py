@@ -355,6 +355,9 @@ class UnifiedRadixCache(BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
+        # Scheduler-thread owned D↔H bookkeeping. The controller records CUDA
+        # stream work and exposes ack lists, but it does not mutate these maps.
+        # L3 storage worker threads communicate through Queue instances instead.
         self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
         self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
         self.enable_storage = False

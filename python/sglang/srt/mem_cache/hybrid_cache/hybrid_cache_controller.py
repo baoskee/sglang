@@ -524,6 +524,28 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+            if transfer.host_indices is not None:
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                page_size = getattr(entry.host_pool, "page_size", self.page_size)
+                kept_tokens = len(transfer.keys) * page_size
+                unused_host_indices = transfer.host_indices[kept_tokens:]
+                if unused_host_indices.numel() > 0:
+                    entry.host_pool.free(unused_host_indices)
+                transfer.host_indices = transfer.host_indices[
+                    :kept_tokens
+                ]
+            if transfer.device_indices is not None:
+                entry = self.mem_pool_host.entry_map.get(transfer.name)
+                page_size = getattr(entry.device_pool, "page_size", self.page_size)
+                kept_tokens = len(transfer.keys) * page_size
+                unused_device_indices = transfer.device_indices[kept_tokens:]
+                if unused_device_indices.numel() > 0 and hasattr(
+                    entry.device_pool, "free"
+                ):
+                    entry.device_pool.free(unused_device_indices)
+                transfer.device_indices = transfer.device_indices[
+                    :kept_tokens
+                ]
 
     def _resolve_pool_transfers_allocation(
         self,

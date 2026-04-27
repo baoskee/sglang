@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
 from functools import partial
+from queue import Empty
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -22,8 +25,16 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.radix_cache import (
+    RadixKey,
+    compute_node_hash_values,
+    split_node_hash_value,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -277,10 +288,53 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         self._reset_full()
 
+    def _parse_storage_backend_extra_config(
+        self, storage_backend_extra_config: Optional[str]
+    ):
+        extra_config = {}
+        if storage_backend_extra_config:
+            if storage_backend_extra_config.startswith("@"):
+                path = storage_backend_extra_config[1:]
+                ext = os.path.splitext(path)[1].lower()
+                with open(path, "rb" if ext == ".toml" else "r") as f:
+                    if ext == ".json":
+                        extra_config = json.load(f)
+                    elif ext == ".toml":
+                        import tomllib
+
+                        extra_config = tomllib.load(f)
+                    elif ext in (".yaml", ".yml"):
+                        import yaml
+
+                        extra_config = yaml.safe_load(f)
+                    else:
+                        raise ValueError(
+                            f"Unsupported config file {path} (config format: {ext})"
+                        )
+            else:
+                extra_config = json.loads(storage_backend_extra_config)
+
+        prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
+        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        prefetch_timeout_per_ki_token = extra_config.pop(
+            "prefetch_timeout_per_ki_token", 0.25
+        )
+        hicache_storage_pass_prefix_keys = extra_config.pop(
+            "hicache_storage_pass_prefix_keys", False
+        )
+        return (
+            extra_config,
+            int(prefetch_threshold),
+            float(prefetch_timeout_base),
+            float(prefetch_timeout_per_ki_token),
+            bool(hicache_storage_pass_prefix_keys),
+        )
+
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey([], None)
+        self.root_node.hash_value = []
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         for ct in self.tree_components:
             self.root_node.component_data[ct].lock_ref = 1
@@ -346,21 +400,44 @@ class UnifiedRadixCache(BasePrefixCache):
         # L3 Storage initialization
         self.enable_storage = server_args.hicache_storage_backend is not None
         if self.enable_storage:
-            prefetch_threshold = server_args.hicache_storage_prefetch_threshold
+            (
+                extra_config,
+                extra_prefetch_threshold,
+                extra_timeout_base,
+                extra_timeout,
+                extra_pass_prefix_keys,
+            ) = self._parse_storage_backend_extra_config(
+                server_args.hicache_storage_backend_extra_config
+            )
+            prefetch_threshold = max(
+                server_args.hicache_storage_prefetch_threshold,
+                extra_prefetch_threshold,
+            )
             prefetch_timeout_per_ki_token = (
-                server_args.hicache_storage_prefetch_timeout_per_ki_token
+                extra_timeout
+                if extra_timeout != 0.25
+                else server_args.hicache_storage_prefetch_timeout_per_ki_token
             )
             prefetch_timeout_per_page = (
                 self.page_size / 1024 * prefetch_timeout_per_ki_token
             )
+            self.cache_controller.attach_storage_backend(
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                host_pools=self.host_pool_group.entries,
+            )
             self.prefetch_threshold = prefetch_threshold
             self.prefetch_timeout_base = (
-                server_args.hicache_storage_prefetch_timeout_base
+                extra_timeout_base
+                if extra_timeout_base != 1
+                else server_args.hicache_storage_prefetch_timeout_base
             )
             self.prefetch_timeout_per_page = prefetch_timeout_per_page
             self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
             self.hicache_storage_pass_prefix_keys = (
-                server_args.hicache_storage_pass_prefix_keys
+                server_args.hicache_storage_pass_prefix_keys or extra_pass_prefix_keys
             )
 
         logger.info(
@@ -767,6 +844,9 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -804,6 +884,8 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+        if self.enable_storage:
+            new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
 
@@ -1183,6 +1265,137 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def _ensure_hash_values(self, node: UnifiedTreeNode) -> None:
+        if node is None:
+            return
+        if node.parent is not None:
+            self._ensure_hash_values(node.parent)
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+    def _protect_host_node(self, node: UnifiedTreeNode, protect_aux: bool = True) -> None:
+        node.protect_host()
+        self.evictable_host_leaves.discard(node)
+        if not protect_aux:
+            return
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                continue
+            if cd.host_lock_ref == 0 and self.host_lru_lists[ct].in_list(node):
+                self.host_lru_lists[ct].remove_node(node)
+            cd.host_lock_ref += 1
+
+    def _release_host_node(
+        self, node: UnifiedTreeNode, release_aux: bool = True
+    ) -> None:
+        node.release_host()
+        if release_aux:
+            for ct in self.tree_components:
+                if ct == BASE_COMPONENT_TYPE:
+                    continue
+                cd = node.component_data[ct]
+                if cd.host_lock_ref == 0:
+                    continue
+                cd.host_lock_ref -= 1
+                if (
+                    cd.host_lock_ref == 0
+                    and cd.value is None
+                    and cd.host_value is not None
+                ):
+                    self.host_lru_lists[ct].insert_mru(node)
+        self._update_evictable_leaf_sets(node)
+
+    def _swa_storage_transfers(
+        self, node: UnifiedTreeNode
+    ) -> Optional[list[PoolTransfer]]:
+        if ComponentType.SWA not in self.components:
+            return None
+        cd = node.component_data[ComponentType.SWA]
+        if cd.host_value is None:
+            return None
+        self._ensure_hash_values(node)
+        if not node.hash_value:
+            return None
+        num_pages = len(cd.host_value) // self.page_size
+        if num_pages <= 0:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=cd.host_value,
+                keys=node.hash_value[-num_pages:],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
+
+    def _alloc_swa_prefetch_transfers(
+        self, prefetch_length: int
+    ) -> Optional[list[PoolTransfer]]:
+        if ComponentType.SWA not in self.components:
+            return None
+        if self.swa_kv_pool_host is None:
+            return None
+
+        sliding_window_size = self.components[ComponentType.SWA].sliding_window_size
+        num_swa_pages = min(
+            prefetch_length // self.page_size,
+            (sliding_window_size + self.page_size - 1) // self.page_size,
+        )
+        if num_swa_pages <= 0:
+            return None
+        num_swa_tokens = num_swa_pages * self.page_size
+        host_indices = self.swa_kv_pool_host.alloc(num_swa_tokens)
+        if host_indices is None:
+            self.evict_host(num_swa_tokens, ComponentType.SWA)
+            host_indices = self.swa_kv_pool_host.alloc(num_swa_tokens)
+        if host_indices is None:
+            return None
+        return [
+            PoolTransfer(
+                name=PoolName.SWA,
+                host_indices=host_indices,
+                keys=["__placeholder__"] * num_swa_pages,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
+
+    def _free_prefetch_extra_pools(
+        self, transfers: Optional[list[PoolTransfer]]
+    ) -> None:
+        for transfer in transfers or []:
+            if transfer.host_indices is None:
+                continue
+            if transfer.name == PoolName.SWA and self.swa_kv_pool_host is not None:
+                self.swa_kv_pool_host.free(transfer.host_indices)
+
+    def write_backup_storage(self, node: UnifiedTreeNode) -> None:
+        if (
+            not self.enable_storage
+            or node.component_data[BASE_COMPONENT_TYPE].host_value is None
+        ):
+            return
+        self._ensure_hash_values(node)
+        if not node.hash_value:
+            return
+        prefix_keys = (
+            node.get_prefix_hash_values(node.parent)
+            if self.hicache_storage_pass_prefix_keys
+            else None
+        )
+        extra_pools = self._swa_storage_transfers(node)
+        operation_id = self.cache_controller.write_storage(
+            node.component_data[BASE_COMPONENT_TYPE].host_value,
+            node.key,
+            node.hash_value,
+            prefix_keys,
+            extra_pools=extra_pools,
+        )
+        self.ongoing_backup[operation_id] = node
+        self._protect_host_node(node, protect_aux=extra_pools is not None)
+
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
@@ -1281,11 +1494,30 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_lock_ref(ancestor_node)
             return None
 
-        avail = self.token_to_kv_pool_allocator.available_size()
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
+        full_avail = getattr(
+            self.token_to_kv_pool_allocator,
+            "full_available_size",
+            self.token_to_kv_pool_allocator.available_size,
+        )()
+        swa_needed = 0
+        if ComponentType.SWA in comp_xfers:
+            swa_needed = comp_xfers[ComponentType.SWA][0].swa_suffix_tokens
+        swa_avail = (
+            self.token_to_kv_pool_allocator.swa_available_size()
+            if swa_needed
+            else swa_needed
+        )
+        full_shortage = max(0, kv_tokens - full_avail)
+        swa_shortage = max(0, swa_needed - swa_avail)
+        needed = max(full_shortage, swa_shortage)
+        if needed > 0:
+            result = self.evict(
+                EvictParams(num_tokens=full_shortage, swa_num_tokens=swa_shortage)
+            )
+            if (
+                result.num_tokens_evicted < full_shortage
+                or result.swa_num_tokens_evicted < swa_shortage
+            ):
                 self.dec_lock_ref(ancestor_node)
                 return None
 
@@ -1352,7 +1584,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        self.ongoing_write_through.pop(ack_id, None)
+                        node = self.ongoing_write_through.pop(ack_id, None)
+                        if self.enable_storage and node is not None:
+                            self.write_backup_storage(node)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1381,6 +1615,8 @@ class UnifiedRadixCache(BasePrefixCache):
             for ack_id in ack_list:
                 node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(node)
+                if self.enable_storage:
+                    self.write_backup_storage(node)
             finish_count -= 1
 
     def loading_check(self) -> None:
@@ -1438,6 +1674,67 @@ class UnifiedRadixCache(BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         self.writing_check()
         self.loading_check()
+        if self.enable_storage:
+            self.drain_storage_control_queues()
+
+    def _drain_storage_control_queues_impl(
+        self,
+        n_revoke: Optional[int],
+        n_backup: Optional[int],
+        n_release: Optional[int],
+    ) -> None:
+        cc = self.cache_controller
+
+        def _drain_queue(q, limit: Optional[int]):
+            drained = 0
+            while limit is None or drained < limit:
+                try:
+                    item = q.get_nowait()
+                except Empty:
+                    break
+                drained += 1
+                yield item
+
+        for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+            info = self.ongoing_prefetch.pop(req_id, None)
+            if info is not None:
+                last_host_node, token_ids, _, operation = info
+                self._free_prefetch_extra_pools(operation.pool_transfers)
+                self._release_host_node(last_host_node, release_aux=False)
+                cc.prefetch_tokens_occupied -= len(token_ids)
+                if cc.prefetch_tokens_occupied < 0:
+                    cc.prefetch_tokens_occupied = 0
+
+        for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+            node = self.ongoing_backup.pop(operation.id, None)
+            if node is not None:
+                self._release_host_node(node)
+
+        host_indices_list = list(_drain_queue(cc.host_mem_release_queue, n_release))
+        if host_indices_list:
+            cc.mem_pool_host.free(torch.cat(host_indices_list))
+
+    def _drain_storage_control_queues_local(self) -> None:
+        self._drain_storage_control_queues_impl(
+            n_revoke=None, n_backup=None, n_release=None
+        )
+
+    def drain_storage_control_queues(self) -> None:
+        cc = self.cache_controller
+        qsizes = torch.tensor(
+            [
+                cc.prefetch_revoke_queue.qsize(),
+                cc.ack_backup_queue.qsize(),
+                cc.host_mem_release_queue.qsize(),
+            ],
+            dtype=torch.int,
+        )
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        self._drain_storage_control_queues_impl(n_revoke, n_backup, n_release)
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
@@ -1481,14 +1778,20 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return
 
-        last_host_node.protect_host()
+        self._protect_host_node(last_host_node, protect_aux=False)
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            last_host_node.release_host()
+            self._release_host_node(last_host_node, release_aux=False)
             # No sufficient host memory for prefetch
+            return
+
+        extra_pools = self._alloc_swa_prefetch_transfers(prefetch_length)
+        if ComponentType.SWA in self.components and extra_pools is None:
+            self.cache_controller.mem_pool_host.free(host_indices)
+            self._release_host_node(last_host_node, release_aux=False)
             return
 
         operation = self.cache_controller.prefetch(
@@ -1497,6 +1800,7 @@ class UnifiedRadixCache(BasePrefixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
+            extra_pools=extra_pools,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
@@ -1588,6 +1892,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
+        swa_host_indices = None
+        swa_loaded_tokens = 0
+        for transfer in operation.pool_transfers or []:
+            if transfer.name == PoolName.SWA:
+                swa_host_indices = transfer.host_indices
+                swa_loaded_pages = operation.pool_storage_result.extra_pool_hit_pages.get(
+                    PoolName.SWA, 0
+                )
+                if transfer.keys is not None:
+                    swa_loaded_pages = min(swa_loaded_pages, len(transfer.keys))
+                swa_loaded_tokens = swa_loaded_pages * self.page_size
+                if swa_host_indices is not None:
+                    swa_host_indices = swa_host_indices[:swa_loaded_tokens]
+                break
+
         matched_length = self._insert_helper_host(
             last_host_node,
             RadixKey(
@@ -1595,13 +1914,19 @@ class UnifiedRadixCache(BasePrefixCache):
             ),
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            swa_host_indices=swa_host_indices,
+            swa_loaded_tokens=swa_loaded_tokens,
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
-        last_host_node.release_host()
+        if swa_host_indices is not None:
+            inserted_new = matched_length < min_completed_tokens
+            if not inserted_new or swa_loaded_tokens == 0:
+                self.swa_kv_pool_host.free(swa_host_indices)
+        self._release_host_node(last_host_node, release_aux=False)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
@@ -1617,6 +1942,8 @@ class UnifiedRadixCache(BasePrefixCache):
         key: RadixKey,
         host_value: torch.Tensor,
         hash_value: list[str],
+        swa_host_indices: Optional[torch.Tensor] = None,
+        swa_loaded_tokens: int = 0,
     ) -> int:
         """Insert prefetched data from storage into the tree (host layer only)."""
         node.last_access_time = time.monotonic()
@@ -1655,6 +1982,22 @@ class UnifiedRadixCache(BasePrefixCache):
             self._update_evictable_leaf_sets(new_node)
             self._update_evictable_leaf_sets(node)
 
+            if (
+                ComponentType.SWA in self.components
+                and swa_host_indices is not None
+                and swa_loaded_tokens > 0
+            ):
+                target = new_node
+                if swa_loaded_tokens < len(new_node.key):
+                    split_len = len(new_node.key) - swa_loaded_tokens
+                    parent = self._split_node(new_node.key, new_node, split_len)
+                    target = next(iter(parent.children.values()))
+
+                cd = target.component_data[ComponentType.SWA]
+                cd.host_value = swa_host_indices[:swa_loaded_tokens].clone()
+                if not self.host_lru_lists[ComponentType.SWA].in_list(target):
+                    self.host_lru_lists[ComponentType.SWA].insert_mru(target)
+
         return matched_length
 
     def terminate_prefetch(self, req_id: str) -> None:
@@ -1674,31 +2017,123 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
-    def clear_storage_backend(self) -> None:
+    def clear_storage_backend(self) -> bool:
         """Clear the storage backend state."""
         self.ongoing_prefetch.clear()
         self.ongoing_backup.clear()
         self.prefetch_loaded_tokens_by_reqid.clear()
-        self.enable_storage = False
+        if self.enable_storage and hasattr(
+            self.cache_controller.storage_backend, "clear"
+        ):
+            self.cache_controller.storage_backend.clear()
+            return True
+        return False
 
     def attach_storage_backend(
         self,
-        _storage_backend: str,
-        _extra_config: Optional[dict] = None,
+        storage_backend: str,
+        storage_backend_extra_config_json: Optional[str] = None,
+        served_model_name: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Attach a storage backend for L3 caching.
 
         Returns (success, message) tuple.
         """
-        # TODO: Implement storage backend attachment for UnifiedRadixCache
-        return False, "Storage backend not yet implemented for UnifiedRadixCache"
+        if hicache_storage_prefetch_policy is not None:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if hicache_storage_prefetch_policy not in allowed:
+                return (
+                    False,
+                    "Invalid hicache_storage_prefetch_policy: "
+                    f"{hicache_storage_prefetch_policy!r}.",
+                )
+
+        if hicache_write_policy is not None:
+            allowed = ["write_back", "write_through", "write_through_selective"]
+            if hicache_write_policy not in allowed:
+                return (
+                    False,
+                    f"Invalid hicache_write_policy: {hicache_write_policy!r}.",
+                )
+
+        if self.enable_storage:
+            current_backend = self.cache_controller.storage_backend_type
+            if current_backend != storage_backend:
+                return (
+                    False,
+                    f"HiCache storage backend is already enabled with backend '{current_backend}'. "
+                    f"Cannot attach different backend '{storage_backend}'. Detach first.",
+                )
+            if hicache_storage_prefetch_policy is not None:
+                self.prefetch_stop_policy = hicache_storage_prefetch_policy
+            if hicache_write_policy is not None:
+                self.cache_controller.write_policy = hicache_write_policy
+                self.write_through_threshold = (
+                    1 if hicache_write_policy == "write_through" else 2
+                )
+            return True, "HiCache storage backend already enabled; policies updated."
+
+        try:
+            (
+                extra_config,
+                prefetch_threshold,
+                prefetch_timeout_base,
+                prefetch_timeout_per_ki_token,
+                pass_prefix_keys,
+            ) = self._parse_storage_backend_extra_config(
+                storage_backend_extra_config_json
+            )
+        except Exception as e:
+            return False, f"Failed to parse storage backend extra config: {e}"
+
+        if hicache_storage_prefetch_policy is not None:
+            self.prefetch_stop_policy = hicache_storage_prefetch_policy
+        if hicache_write_policy is not None:
+            self.cache_controller.write_policy = hicache_write_policy
+            self.write_through_threshold = (
+                1 if hicache_write_policy == "write_through" else 2
+            )
+
+        try:
+            self.cache_controller.attach_storage_backend(
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=served_model_name,
+                storage_backend_extra_config=extra_config,
+                host_pools=self.host_pool_group.entries,
+            )
+        except Exception as e:
+            logger.exception("Failed to attach storage backend '%s'", storage_backend)
+            return False, f"Failed to attach storage backend '{storage_backend}': {e}"
+
+        self.enable_storage = True
+        self.prefetch_threshold = prefetch_threshold
+        self.prefetch_timeout_base = prefetch_timeout_base
+        self.prefetch_timeout_per_page = (
+            self.page_size / 1024 * prefetch_timeout_per_ki_token
+        )
+        self.hicache_storage_pass_prefix_keys = pass_prefix_keys
+        return True, "Attached HiCache storage backend successfully."
 
     def detach_storage_backend(self) -> tuple[bool, str]:
         """Detach the current storage backend.
 
         Returns (success, message) tuple.
         """
-        self.clear_storage_backend()
+        if not self.enable_storage:
+            return True, "Storage backend already detached"
+        try:
+            self._drain_storage_control_queues_local()
+            self.cache_controller.detach_storage_backend()
+        except Exception as e:
+            logger.exception("Failed to detach storage backend")
+            return False, f"Failed to detach storage backend: {e}"
+        self.ongoing_prefetch.clear()
+        self.ongoing_backup.clear()
+        self.prefetch_loaded_tokens_by_reqid.clear()
+        self.enable_storage = False
         return True, "Storage backend detached"
 
     def release_aborted_request(self, rid: str) -> None:
@@ -1717,9 +2152,10 @@ class UnifiedRadixCache(BasePrefixCache):
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         if self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
-        last_host_node.release_host()
+        self._release_host_node(last_host_node, release_aux=False)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
+        self._free_prefetch_extra_pools(operation.pool_transfers)
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
     # ---- Query / Inspection APIs ----

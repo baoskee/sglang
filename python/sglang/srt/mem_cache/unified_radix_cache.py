@@ -289,6 +289,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
         self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
         self.enable_storage = False
+        self.hicache_storage_pass_prefix_keys = False
+        self.prefetch_threshold = 256
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
 
@@ -1409,6 +1411,40 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def prefetch_from_storage(
+        self,
+        _req_id: str,
+        _last_host_node: UnifiedTreeNode,
+        new_input_tokens: list[int],
+        _last_hash: Optional[str] = None,
+        _prefix_keys: Optional[list[str]] = None,
+    ) -> None:
+        """Prefetch KV cache from L3 storage layer.
+
+        This is called by the scheduler to initiate prefetching of KV cache
+        data from persistent storage (L3) to host memory (L2).
+        """
+        # Align the number of fetching tokens to the page size
+        prefetch_length = len(new_input_tokens) - (
+            len(new_input_tokens) % self.page_size
+        )
+        new_input_tokens = new_input_tokens[:prefetch_length]
+
+        if (
+            not self.enable_storage
+            or prefetch_length < self.prefetch_threshold
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return
+
+        # TODO: Implement full prefetch logic for UnifiedRadixCache
+        # This would involve:
+        # 1. Protecting the host node
+        # 2. Allocating host memory
+        # 3. Initiating async prefetch from storage
+        # 4. Tracking ongoing prefetch operations
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

@@ -1036,8 +1036,12 @@ class UnifiedRadixCache(BasePrefixCache):
         """Cascade eviction from trigger to lower-or-equal priority components."""
         is_leaf = len(node.children) == 0
         trigger_priority = trigger.eviction_priority(is_leaf)
+        full_device_evicted = (
+            EvictLayer.DEVICE in target
+            and trigger.component_type == BASE_COMPONENT_TYPE
+        )
 
-        for comp in self._components_tuple:
+        for comp in self._components_in_eviction_order(target):
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
@@ -1048,17 +1052,37 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._evict_component_and_detach_lru(
                         node, comp, target=target, tracker=tracker
                     )
+                    if (
+                        EvictLayer.DEVICE in target
+                        and comp.component_type == BASE_COMPONENT_TYPE
+                    ):
+                        full_device_evicted = True
 
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
         # This is deferred from evict_component because free_swa needs it.
-        if (
-            EvictLayer.DEVICE in target
-            and trigger.component_type == BASE_COMPONENT_TYPE
-        ):
+        if full_device_evicted:
             self._finalize_full_device_eviction(node)
 
         self._update_evictable_leaf_sets(node)
+
+    def _components_in_eviction_order(self, target: EvictLayer) -> list[TreeComponent]:
+        """Evict auxiliary device components before Full.
+
+        SWA frees device state through the Full→SWA mapping, so Full slots must
+        remain allocated until all auxiliary device evictions have completed.
+        """
+        if EvictLayer.DEVICE not in target:
+            return list(self._components_tuple)
+        return [
+            comp
+            for comp in self._components_tuple
+            if comp.component_type != BASE_COMPONENT_TYPE
+        ] + [
+            comp
+            for comp in self._components_tuple
+            if comp.component_type == BASE_COMPONENT_TYPE
+        ]
 
     def _finalize_full_device_eviction(self, node: UnifiedTreeNode) -> None:
         """Tombstone Full.value after all coupled auxiliary device data is freed."""
@@ -1264,7 +1288,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
-                for comp in self._components_tuple:
+                for comp in self._components_in_eviction_order(EvictLayer.ALL):
                     self._evict_component_and_detach_lru(
                         node, comp, target=EvictLayer.ALL, tracker=tracker
                     )
@@ -1285,7 +1309,7 @@ class UnifiedRadixCache(BasePrefixCache):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
-        for comp in self._components_tuple:
+        for comp in self._components_in_eviction_order(EvictLayer.ALL):
             self._evict_component_and_detach_lru(
                 node, comp, target=EvictLayer.ALL, tracker=tracker
             )

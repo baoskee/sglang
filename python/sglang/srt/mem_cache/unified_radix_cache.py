@@ -409,15 +409,8 @@ class UnifiedRadixCache(BasePrefixCache):
             ) = self._parse_storage_backend_extra_config(
                 server_args.hicache_storage_backend_extra_config
             )
-            prefetch_threshold = max(
-                server_args.hicache_storage_prefetch_threshold,
-                extra_prefetch_threshold,
-            )
-            prefetch_timeout_per_ki_token = (
-                extra_timeout
-                if extra_timeout != 0.25
-                else server_args.hicache_storage_prefetch_timeout_per_ki_token
-            )
+            prefetch_threshold = extra_prefetch_threshold
+            prefetch_timeout_per_ki_token = extra_timeout
             prefetch_timeout_per_page = (
                 self.page_size / 1024 * prefetch_timeout_per_ki_token
             )
@@ -429,11 +422,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_pools=self.host_pool_group.entries,
             )
             self.prefetch_threshold = prefetch_threshold
-            self.prefetch_timeout_base = (
-                extra_timeout_base
-                if extra_timeout_base != 1
-                else server_args.hicache_storage_prefetch_timeout_base
-            )
+            self.prefetch_timeout_base = extra_timeout_base
             self.prefetch_timeout_per_page = prefetch_timeout_per_page
             self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
             self.hicache_storage_pass_prefix_keys = (

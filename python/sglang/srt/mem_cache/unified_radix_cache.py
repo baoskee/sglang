@@ -1286,10 +1286,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
         for comp in self._components_tuple:
-            _, hf = self._evict_component_and_detach_lru(
-                node, comp, target=EvictLayer.ALL, tracker=None
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=tracker
             )
-            tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker)

@@ -615,6 +615,18 @@ class UnifiedRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        if (
+            ComponentType.SWA in self.components
+            and ComponentType.MAMBA not in self.components
+        ):
+            # The unified SWA tree can only safely take ownership of request KV
+            # when caching a finished request, where the SWA eviction boundary is
+            # final. For unfinished requests, partial-window inserts can leave
+            # FULL pages owned by both the request and tree, which breaks pool
+            # accounting. Keep the KV request-local until cache_finished_req().
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            return
+
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len, chunked=chunked

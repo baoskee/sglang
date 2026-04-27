@@ -101,9 +101,8 @@ class FullComponent(TreeComponent):
             self._free_full(cd.value)
             freed = len(cd.value)
             self.cache.component_evictable_size_[self.component_type] -= freed
-            # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
-            # because SWA's free_swa still needs to read Full.value.
-            # cd.value = None
+            # Tombstone is finalized by UnifiedRadixCache after auxiliary
+            # components have read Full.value to release their coupled slots.
 
         # Host layer
         if EvictLayer.HOST in target and cd.host_value is not None:

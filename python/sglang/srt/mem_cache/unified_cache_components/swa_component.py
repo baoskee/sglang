@@ -247,9 +247,12 @@ class SWAComponent(TreeComponent):
             # Pass full indices to free_swa so slots with no SWA pair are
             # skipped. Freeing swa_value directly would double free those
             # entries since they all map to the same sentinel slot.
-            self.cache.token_to_kv_pool_allocator.free_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert full_value is not None, (
+                "SWA device eviction requires live Full.value indices; "
+                "Full tombstone must be finalized after auxiliary eviction."
             )
+            self.cache.token_to_kv_pool_allocator.free_swa(full_value)
             freed = len(cd.value)
             self.cache.component_evictable_size_[ct] -= freed
             cd.value = None

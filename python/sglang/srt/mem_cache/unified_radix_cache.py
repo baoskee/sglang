@@ -1043,15 +1043,19 @@ class UnifiedRadixCache(BasePrefixCache):
             EvictLayer.DEVICE in target
             and trigger.component_type == BASE_COMPONENT_TYPE
         ):
-            cd = node.component_data[trigger.component_type]
-            assert cd.value is not None, (
-                "Full.value must stay present until _cascade_evict completes "
-                "because auxiliary components may need it during eviction."
-            )
-            cd.value = None
-            assert cd.value is None
+            self._finalize_full_device_eviction(node)
 
         self._update_evictable_leaf_sets(node)
+
+    def _finalize_full_device_eviction(self, node: UnifiedTreeNode) -> None:
+        """Tombstone Full.value after all coupled auxiliary device data is freed."""
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        assert cd.value is not None, (
+            "Full.value must stay present until auxiliary components complete "
+            "device eviction because they may need the full indices."
+        )
+        cd.value = None
+        assert cd.value is None
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
         key = node.key.child_key(self.page_size)
@@ -1251,7 +1255,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._evict_component_and_detach_lru(
                         node, comp, target=EvictLayer.ALL, tracker=tracker
                     )
-                node.component_data[BASE_COMPONENT_TYPE].value = None
+                self._finalize_full_device_eviction(node)
                 self.evictable_device_leaves.discard(node)
                 parent = node.parent
                 self._remove_leaf_from_parent(node)

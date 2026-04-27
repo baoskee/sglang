@@ -1519,9 +1519,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Build KV transfer
         last_hit_node = node
-        kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
+        kv_xfers = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             last_hit_node, CacheTransferPhase.LOAD_BACK
-        )[0]
+        )
+        if not kv_xfers:
+            return None
+        kv_xfer = kv_xfers[0]
 
         # Lock path & pre-evict if device pool is insufficient
         nodes_to_load = kv_xfer.nodes_to_load
@@ -1546,9 +1549,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Aux builders, especially SWA, may split host-only nodes to cap the
         # transferred suffix. Rebuild the Full-KV transfer after those splits so
         # nodes_to_load matches the final path that inc_lock_ref will lock.
-        kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
+        kv_xfers = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             last_hit_node, CacheTransferPhase.LOAD_BACK
-        )[0]
+        )
+        if not kv_xfers:
+            self.dec_lock_ref(ancestor_node)
+            return None
+        kv_xfer = kv_xfers[0]
         nodes_to_load = kv_xfer.nodes_to_load
         kv_tokens = len(kv_xfer.host_indices)
 

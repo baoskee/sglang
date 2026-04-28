@@ -548,6 +548,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name == PoolName.SWA:
+            base_suffix = f"_{self.mha_suffix}_{PoolName.SWA}"
+            suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes

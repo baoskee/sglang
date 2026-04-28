@@ -2049,6 +2049,13 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            # If the request already has a device-cache prefix hit, avoid
+            # starting an L3 lookup for the remaining tail on the TTFT path.
+            # L3 prefetch is most valuable when recovering from no GPU-local
+            # prefix. For normal shared-prefix multi-turn traffic, extending a
+            # GPU hit through file-backed storage can dominate admission latency.
+            if len(req.prefix_indices) > 0:
+                return
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
@@ -2570,6 +2577,18 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                self.enable_hicache_storage
+                and len(req.prefix_indices) > 0
+                and req.storage_hit_length > 0
+            ):
+                # Prefer the GPU-local prefix for TTFT-sensitive continuations.
+                # A storage-prefetched extension may save prefill work, but with
+                # file-backed storage it can be slower than computing the small
+                # tail and makes single shared-prefix turns feel much worse.
+                req.last_host_node = req.last_node
+                req.host_hit_length = 0
+                req.storage_hit_length = 0
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

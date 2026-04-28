@@ -100,10 +100,11 @@ class SWAComponent(TreeComponent):
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice.clone()
+            old_full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            new_full_value = value_slice
+            if not torch.equal(old_full_value, new_full_value):
+                self.cache.token_to_kv_pool_allocator.free(old_full_value)
+            node.component_data[BASE_COMPONENT_TYPE].value = new_full_value.clone()
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -114,13 +115,14 @@ class SWAComponent(TreeComponent):
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
             start_idx = swa_evicted_seqlen - total_prefix_len
-            self.cache.token_to_kv_pool_allocator.free(
-                node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
-            )
-            self.cache._split_node(node.key, node, start_idx)
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
+            old_full_suffix = node.component_data[BASE_COMPONENT_TYPE].value[
                 start_idx:
-            ].clone()
+            ]
+            new_full_suffix = value_slice[start_idx:]
+            if not torch.equal(old_full_suffix, new_full_suffix):
+                self.cache.token_to_kv_pool_allocator.free(old_full_suffix)
+            self.cache._split_node(node.key, node, start_idx)
+            node.component_data[BASE_COMPONENT_TYPE].value = new_full_suffix.clone()
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -247,9 +249,12 @@ class SWAComponent(TreeComponent):
             # Pass full indices to free_swa so slots with no SWA pair are
             # skipped. Freeing swa_value directly would double free those
             # entries since they all map to the same sentinel slot.
-            self.cache.token_to_kv_pool_allocator.free_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert full_value is not None, (
+                "SWA device eviction requires live Full.value indices; "
+                "Full tombstone must be finalized after auxiliary eviction."
             )
+            self.cache.token_to_kv_pool_allocator.free_swa(full_value)
             freed = len(cd.value)
             self.cache.component_evictable_size_[ct] -= freed
             cd.value = None
@@ -397,18 +402,28 @@ class SWAComponent(TreeComponent):
             # Walk the evicted chain leaf to root, collecting SWA host_values
             # until they cover sliding_window_size. SWA host data is always a
             # contiguous suffix, so the first None ends the walk.
+            max_suffix_tokens = kw.get("max_suffix_tokens", self.sliding_window_size)
+            target_swa_tokens = min(self.sliding_window_size, max_suffix_tokens)
+            if target_swa_tokens <= 0:
+                return None
             collected_leaf_first: list[torch.Tensor] = []
             nodes_leaf_first: list = []
             n_swa = 0
             cur = node
-            while cur.evicted:
+            while cur.evicted and n_swa < target_swa_tokens:
                 cd = cur.component_data[ct]
                 if cd.host_value is None:
                     break
+                remaining = target_swa_tokens - n_swa
+                if len(cd.host_value) > remaining:
+                    split_len = len(cur.key) - remaining
+                    if split_len > 0:
+                        self.cache._split_node(cur.key, cur, split_len)
+                        cd = cur.component_data[ct]
                 collected_leaf_first.append(cd.host_value)
                 nodes_leaf_first.append(cur)
                 n_swa += len(cd.host_value)
-                if n_swa >= self.sliding_window_size:
+                if n_swa >= target_swa_tokens:
                     break
                 cur = cur.parent
             if not collected_leaf_first:
@@ -418,7 +433,7 @@ class SWAComponent(TreeComponent):
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=torch.cat(collected_leaf_first),
+                    host_indices=torch.cat([x.cpu() for x in collected_leaf_first]),
                     device_indices=None,
                     swa_suffix_tokens=n_swa,
                     nodes_to_load=nodes_leaf_first,
